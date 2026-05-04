@@ -13,6 +13,7 @@ use std::{
 
 use clap::Args;
 use colorful::*;
+use serde::Serialize;
 
 use msru::{Accessor, Msr};
 
@@ -22,11 +23,20 @@ enum Verbosity {
     Short,
 }
 
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Default,
+    Json,
+}
+
 #[derive(Args, Clone)]
 pub struct Ok {
     /// Show only failures with summary counts
     #[arg(short, long)]
     short: bool,
+    /// Controls how test results are rendered
+    #[arg(short, long, value_enum, default_value_t = OutputFormat::Default)]
+    output: OutputFormat,
 }
 
 impl Ok {
@@ -36,6 +46,10 @@ impl Ok {
         } else {
             Verbosity::Default
         }
+    }
+
+    fn output_format(&self) -> OutputFormat {
+        self.output
     }
 }
 
@@ -53,18 +67,25 @@ struct Test {
     sub: Vec<Test>,
 }
 
+#[derive(Serialize)]
 struct TestResult {
     name: String,
+    #[serde(rename = "status")]
     stat: TestState,
+    #[serde(rename = "message")]
     mesg: Option<String>,
 }
 
+#[derive(Serialize)]
 struct TestResultNode {
+    #[serde(flatten)]
     result: TestResult,
+    #[serde(rename = "subtests", skip_serializing_if = "Vec::is_empty")]
     sub: Vec<TestResultNode>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum TestState {
     Pass,
     Skip,
@@ -509,13 +530,14 @@ const INDENT: usize = 2;
 pub fn cmd(quiet: bool, args: Ok) -> Result<()> {
     let tests = collect_tests();
     let verbosity = args.verbosity();
+    let output_format = args.output_format();
 
     let results = run_test(&tests, SEV_MASK | ES_MASK | SNP_MASK);
 
     if !quiet {
         match verbosity {
-            Verbosity::Default => render_default(&results, 0),
-            Verbosity::Short => render_short(&results),
+            Verbosity::Default => render_default(&results, 0, output_format),
+            Verbosity::Short => render_short(&results, output_format),
         }
     }
 
@@ -576,59 +598,91 @@ fn all_passed(results: &[TestResultNode]) -> bool {
     })
 }
 
-fn render_default(results: &[TestResultNode], level: usize) {
-    for node in results {
-        let msg = match &node.result.mesg {
-            Some(m) => format!(": {}", m),
-            None => "".to_string(),
-        };
-        println!(
-            "[ {:^4} ] {:width$}- {}{}",
-            format!("{}", node.result.stat),
-            "",
-            node.result.name,
-            msg,
-            width = level
-        );
-        render_default(&node.sub, level + INDENT);
+fn render_default(results: &[TestResultNode], level: usize, output_format: OutputFormat) {
+    match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(results).unwrap();
+            println!("{}", json);
+        }
+        OutputFormat::Default => {
+            for node in results {
+                let msg = match &node.result.mesg {
+                    Some(m) => format!(": {}", m),
+                    None => "".to_string(),
+                };
+                println!(
+                    "[ {:^4} ] {:width$}- {}{}",
+                    format!("{}", node.result.stat),
+                    "",
+                    node.result.name,
+                    msg,
+                    width = level
+                );
+                render_default(&node.sub, level + INDENT, output_format);
+            }
+        }
     }
 }
 
-fn render_short(results: &[TestResultNode]) {
+fn render_short(results: &[TestResultNode], output_format: OutputFormat) {
     let mut passed = Vec::new();
     let mut failed = Vec::new();
     let mut skipped = Vec::new();
 
     flatten_results(results, &mut passed, &mut failed, &mut skipped);
 
-    if !failed.is_empty() {
-        println!("{}", "Failures:".red());
-        for e in &failed {
-            let msg = match &e.mesg {
-                Some(m) => format!(": {}", m),
-                None => String::new(),
-            };
-            println!("[ {:^4} ] - {}{}", "FAIL".red(), e.name, msg);
-        }
-    }
+    match output_format {
+        OutputFormat::Json => {
+            let mut results = serde_json::json!({
+                "summary": {
+                    "total": passed.len() + failed.len() + skipped.len(),
+                    "passed": passed.len(),
+                    "skipped": skipped.len(),
+                    "failed": failed.len(),
+                }
+            });
 
-    if !skipped.is_empty() {
-        println!("\n{}:", "SKIPPED".yellow());
-        for s in &skipped {
-            println!("[ {:^4} ] - {}", "SKIP".yellow(), s.name);
-        }
-    }
+            if !failed.is_empty() {
+                results["failed"] = serde_json::json!(failed);
+            }
 
-    let total = passed.len() + failed.len() + skipped.len();
-    println!(
-        "\n{} tests: {} passed, {} failed, {} skipped",
-        total,
-        passed.len(),
-        failed.len(),
-        skipped.len(),
-    );
-    if failed.is_empty() {
-        println!("{}", "All tests passed.".green());
+            if !skipped.is_empty() {
+                results["skipped"] = serde_json::json!(skipped);
+            }
+
+            println!("{}", serde_json::to_string_pretty(&results).unwrap());
+        }
+        OutputFormat::Default => {
+            if !failed.is_empty() {
+                println!("{}", "Failures:".red());
+                for e in &failed {
+                    let msg = match &e.mesg {
+                        Some(m) => format!(": {}", m),
+                        None => String::new(),
+                    };
+                    println!("[ {:^4} ] - {}{}", "FAIL".red(), e.name, msg);
+                }
+            }
+
+            if !skipped.is_empty() {
+                println!("\n{}:", "SKIPPED".yellow());
+                for s in &skipped {
+                    println!("[ {:^4} ] - {}", "SKIP".yellow(), s.name);
+                }
+            }
+
+            let total = passed.len() + failed.len() + skipped.len();
+            println!(
+                "\n{} tests: {} passed, {} failed, {} skipped",
+                total,
+                passed.len(),
+                failed.len(),
+                skipped.len(),
+            );
+            if failed.is_empty() {
+                println!("{}", "All tests passed.".green());
+            }
+        }
     }
 }
 
