@@ -67,12 +67,34 @@ struct Test {
     sub: Vec<Test>,
 }
 
+fn serialize_stripped<S>(s: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let stripped = strip_ansi_escapes::strip_str(s);
+    serializer.serialize_str(&stripped)
+}
+
+fn serialize_option_stripped<S>(opt: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match opt {
+        Some(s) => {
+            let stripped = strip_ansi_escapes::strip_str(s);
+            serializer.serialize_some(&stripped)
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Serialize)]
 struct TestResult {
+    #[serde(serialize_with = "serialize_stripped")]
     name: String,
     #[serde(rename = "status")]
     stat: TestState,
-    #[serde(rename = "message")]
+    #[serde(rename = "message", serialize_with = "serialize_option_stripped")]
     mesg: Option<String>,
 }
 
@@ -608,7 +630,7 @@ fn render_default(results: &[TestResultNode], level: usize, output_format: Outpu
             for node in results {
                 let msg = match &node.result.mesg {
                     Some(m) => format!(": {}", m),
-                    None => "".to_string(),
+                    None => String::new(),
                 };
                 println!(
                     "[ {:^4} ] {:width$}- {}{}",
