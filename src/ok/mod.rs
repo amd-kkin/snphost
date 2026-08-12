@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod kvm;
+
 use super::*;
 
 use std::{
     arch::x86_64,
-    fmt,
-    fs::{self, File},
+    fmt, fs,
     mem::{transmute, MaybeUninit},
-    os::unix::io::AsRawFd,
     str::from_utf8,
 };
 
@@ -40,6 +40,10 @@ pub struct Ok {
     #[arg(short, long, conflicts_with = "short")]
     verbose: bool,
 
+    /// Include optional feature tests (skipped by default)
+    #[arg(short, long)]
+    features: bool,
+
     /// Controls how test results are rendered
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Default)]
     output: OutputFormat,
@@ -71,6 +75,8 @@ enum TestCategory {
     PlatformInitialized,
     KvmConfig,
     Compliance,
+    /// Features that enhance SEV guests but are not required for SEV, SEV-ES, or SEV-SNP.
+    OptionalFeatures,
 }
 
 impl fmt::Display for TestCategory {
@@ -82,6 +88,7 @@ impl fmt::Display for TestCategory {
             TestCategory::PlatformInitialized => write!(f, "Platform Initialized"),
             TestCategory::KvmConfig => write!(f, "KVM Config"),
             TestCategory::Compliance => write!(f, "Compliance"),
+            TestCategory::OptionalFeatures => write!(f, "Optional Features"),
         }
     }
 }
@@ -466,6 +473,46 @@ fn collect_tests() -> Vec<Test> {
                                     }],
                                 },
                                 Test {
+                                    name: "(Optional Feature) Secure TSC",
+                                    gen_mask: SNP_MASK,
+                                    run: Box::new(|| {
+                                        let res = unsafe { x86_64::__cpuid(0x8000_001f) };
+                                        let mut errors = Vec::new();
+
+                                        if (res.eax & (0x1 << 8)) == 0 {
+                                            errors.push(format!(
+                                                "SecureTSC bit 8 not set in CPUID 0x8000001F EAX: {:#010x}",
+                                                res.eax
+                                            ));
+                                        }
+
+                                        match kvm_get_vmsa_features() {
+                                            Ok(features) if features & kvm::VmsaFeatures::SECURE_TSC.bits() == 0 => errors.push(format!(
+                                                "SecureTSC not set in KVM sev_supported_vmsa_features: {:#018x}",
+                                                features
+                                            )),
+                                            Err(e) => errors.push(e),
+                                            _ => {}
+                                        }
+
+                                        TestResult {
+                                            name: format!("({}) Secure TSC", TestCategory::OptionalFeatures),
+                                            stat: if errors.is_empty() { TestState::Pass } else { TestState::Fail },
+                                            mesg: Some(if errors.is_empty() {
+                                                "Configurable".to_string()
+                                            } else {
+                                                errors.join("; ")
+                                            }),
+                                        }
+                                    }),
+                                    meta: TestMetadata {
+                                        category: TestCategory::OptionalFeatures,
+                                        description: "Checks SecureTSC hardware support, and kernel support",
+                                        fix_hint: "Requires EPYC 9004+ CPU and kernel 6.18+ with sev_snp=1",
+                                    },
+                                    sub: vec![],
+                                },
+                                Test {
                                     name: "SEV-SNP",
                                     gen_mask: SNP_MASK,
                                     run: Box::new(snp_test),
@@ -746,7 +793,7 @@ const INDENT: usize = 2;
 
 pub fn cmd(quiet: bool, args: Ok) -> Result<()> {
     let tests = collect_tests();
-    let results = run_test(&tests, SEV_MASK | ES_MASK | SNP_MASK);
+    let results = run_test(&tests, SEV_MASK | ES_MASK | SNP_MASK, args.features);
 
     if !quiet {
         match (args.output_format(), args.verbosity()) {
@@ -763,10 +810,14 @@ pub fn cmd(quiet: bool, args: Ok) -> Result<()> {
     Ok(())
 }
 
-fn run_test(tests: &[Test], mask: usize) -> Vec<TestResultNode> {
+fn run_test(tests: &[Test], mask: usize, features: bool) -> Vec<TestResultNode> {
     let mut results = Vec::new();
 
     for t in tests {
+        if !features && t.meta.category == TestCategory::OptionalFeatures {
+            continue;
+        }
+
         let node = if (t.gen_mask & mask) != t.gen_mask {
             // Test doesn't match generation mask - skip it and all children
             create_skip_node(t)
@@ -775,7 +826,7 @@ fn run_test(tests: &[Test], mask: usize) -> Vec<TestResultNode> {
             let res = (t.run)();
 
             let sub = match res.stat {
-                TestState::Pass => run_test(&t.sub, mask),
+                TestState::Pass => run_test(&t.sub, mask, features),
                 TestState::Fail => create_skip_nodes(&t.sub),
                 TestState::Skip => unreachable!(),
             };
@@ -868,7 +919,9 @@ fn render_short(results: &[TestResultNode]) {
     }
 }
 
-fn organize_by_category(results: &[TestResultNode]) -> Vec<(TestCategory, Vec<&TestResultNode>)> {
+fn organize_by_category<'a>(
+    flattened_nodes: &[&'a TestResultNode],
+) -> Vec<(TestCategory, Vec<&'a TestResultNode>)> {
     let categories_order = [
         TestCategory::CpuSupport,
         TestCategory::CpuInfo,
@@ -876,24 +929,14 @@ fn organize_by_category(results: &[TestResultNode]) -> Vec<(TestCategory, Vec<&T
         TestCategory::PlatformInitialized,
         TestCategory::KvmConfig,
         TestCategory::Compliance,
+        TestCategory::OptionalFeatures,
     ];
 
-    // Flatten the tree structure into a list
-    let mut all_nodes = Vec::new();
-    flatten_nodes(results, &mut all_nodes);
-
-    // Filter out skipped tests
-    let all_nodes: Vec<_> = all_nodes
-        .into_iter()
-        .filter(|node| node.result.stat != TestState::Skip)
-        .collect();
-
-    // Group tests by category
     let mut categorized = Vec::new();
     for cat in &categories_order {
-        let cat_entries: Vec<_> = all_nodes
+        let cat_entries: Vec<_> = flattened_nodes
             .iter()
-            .filter(|node| node.meta.category == *cat)
+            .filter(|node| node.result.stat != TestState::Skip && node.meta.category == *cat)
             .copied()
             .collect();
 
@@ -906,7 +949,10 @@ fn organize_by_category(results: &[TestResultNode]) -> Vec<(TestCategory, Vec<&T
 }
 
 fn render_verbose(results: &[TestResultNode]) {
-    let categorized = organize_by_category(results);
+    let mut all_nodes = Vec::new();
+    flatten_nodes(results, &mut all_nodes);
+
+    let categorized = organize_by_category(&all_nodes);
 
     for (cat, cat_entries) in &categorized {
         println!("\n=== {} ===", cat);
@@ -934,11 +980,13 @@ fn render_verbose(results: &[TestResultNode]) {
         }
     }
 
-    // Collect failed tests from all categories
-    let failed_nodes: Vec<_> = categorized
+    let failed_nodes: Vec<_> = all_nodes
         .iter()
-        .flat_map(|(_, nodes)| nodes.iter())
-        .filter(|node| node.result.stat == TestState::Fail)
+        .filter(|n| n.result.stat == TestState::Fail)
+        .collect();
+    let skipped_nodes: Vec<_> = all_nodes
+        .iter()
+        .filter(|n| n.result.stat == TestState::Skip)
         .collect();
 
     if !failed_nodes.is_empty() {
@@ -953,6 +1001,13 @@ fn render_verbose(results: &[TestResultNode]) {
         println!();
     } else {
         println!("\n{}", "No issues detected.".green());
+    }
+
+    if !skipped_nodes.is_empty() {
+        println!("\n{}:", "SKIPPED".yellow());
+        for s in &skipped_nodes {
+            println!("[ {:^4} ] - {}", "SKIP".yellow(), s.result.name);
+        }
     }
 
     let counts = count_results(results);
@@ -1030,13 +1085,9 @@ fn render_json(results: &[TestResultNode]) -> Result<()> {
     let mut all_nodes = Vec::new();
     flatten_nodes(results, &mut all_nodes);
 
-    let all_nodes: Vec<_> = all_nodes
-        .into_iter()
-        .filter(|node| node.result.stat != TestState::Skip)
-        .collect();
-
     let tests: Vec<_> = all_nodes
         .iter()
+        .filter(|node| node.result.stat != TestState::Skip)
         .map(|node| {
             let mut test = serde_json::json!({
                 "name": strip_ansi(&node.result.name),
@@ -1075,11 +1126,18 @@ fn render_json(results: &[TestResultNode]) -> Result<()> {
         })
         .collect();
 
+    let skipped: Vec<_> = all_nodes
+        .iter()
+        .filter(|node| node.result.stat == TestState::Skip)
+        .map(|node| serde_json::json!(strip_ansi(&node.result.name)))
+        .collect();
+
     let counts = count_results(results);
 
     let output = serde_json::json!({
         "tests": tests,
         "failures": failures,
+        "skipped": skipped,
         "summary": {
             "total": counts.total,
             "passed": counts.passed,
@@ -1179,76 +1237,15 @@ fn dev_sev_rw(file: &fs::OpenOptions) -> Result<()> {
 }
 
 fn has_kvm_support() -> TestResult {
-    let path = "/dev/kvm";
+    kvm::has_kvm_support()
+}
 
-    let (stat, mesg) = match File::open(path) {
-        Ok(kvm) => {
-            let api_version = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00, 0) };
-            if api_version < 0 {
-                (
-                    TestState::Fail,
-                    "Error - accessing KVM device node failed".to_string(),
-                )
-            } else {
-                (TestState::Pass, format!("API version: {}", api_version))
-            }
-        }
-        Err(e) => (TestState::Fail, format!("Error reading {}: ({})", path, e)),
-    };
-
-    TestResult {
-        name: "KVM supported".to_string(),
-        stat,
-        mesg: Some(mesg),
-    }
+fn kvm_get_vmsa_features() -> Result<u64, String> {
+    kvm::kvm_get_vmsa_features()
 }
 
 fn sev_enabled_in_kvm(gen: SevGeneration) -> TestResult {
-    let path_loc = match gen {
-        SevGeneration::Sev => "/sys/module/kvm_amd/parameters/sev",
-        SevGeneration::Es => "/sys/module/kvm_amd/parameters/sev_es",
-        SevGeneration::Snp => "/sys/module/kvm_amd/parameters/sev_snp",
-    };
-    let path = std::path::Path::new(path_loc);
-
-    let (stat, mesg) = if path.exists() {
-        match std::fs::read_to_string(path_loc) {
-            Ok(result) => {
-                if result.trim() == "1" || result.trim() == "Y" {
-                    (TestState::Pass, None)
-                } else {
-                    (
-                        TestState::Fail,
-                        Some(format!(
-                            "Error - contents read from {}: {}",
-                            path_loc,
-                            result.trim()
-                        )),
-                    )
-                }
-            }
-            Err(e) => (
-                TestState::Fail,
-                Some(format!("Error - (unable to read {}): {}", path_loc, e,)),
-            ),
-        }
-    } else {
-        (
-            TestState::Fail,
-            Some(format!("Error - {} does not exist", path_loc)),
-        )
-    };
-
-    TestResult {
-        name: match gen {
-            SevGeneration::Sev => "SEV enabled in KVM",
-            SevGeneration::Es => "SEV-ES enabled in KVM",
-            SevGeneration::Snp => "SEV-SNP enabled in KVM",
-        }
-        .to_string(),
-        stat,
-        mesg,
-    }
+    kvm::sev_enabled_in_kvm(gen)
 }
 
 fn memlock_rlimit() -> TestResult {
